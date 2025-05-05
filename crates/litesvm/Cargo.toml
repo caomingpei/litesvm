@@ -71,6 +71,8 @@ solana-transaction-error.workspace = true
 solana-vote-program.workspace = true
 thiserror.workspace = true
 
+instrument.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
 ed25519-dalek.workspace = true
@@ -106,3 +108,6 @@ harness = false
 [[bench]]
 name = "max_perf"
 harness = false
+
+[patch.crates-io]
+solana-program-runtime = { path = "../agave/program-runtime" , version = "=2.2.4"}
