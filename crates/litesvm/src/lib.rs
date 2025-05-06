@@ -329,7 +329,7 @@ use {
     },
 };
 // NovaFuzz:
-use instrument::Instrumenter;
+use instrument::DepthManager;
 
 pub mod error;
 pub mod types;
@@ -959,7 +959,7 @@ impl LiteSVM {
         tx: &SanitizedTransaction,
         compute_budget_limits: ComputeBudgetLimits,
         log_collector: Rc<RefCell<LogCollector>>,
-        instrumenter: Rc<RefCell<Instrumenter>>,
+        depth_manager: Rc<RefCell<DepthManager>>,
     ) -> (
         Result<(), TransactionError>,
         u64,
@@ -1119,7 +1119,7 @@ impl LiteSVM {
                         ),
                         Some(log_collector),
                         compute_budget,
-                        instrumenter,
+                        depth_manager,
                     ),
                     &mut ExecuteTimings::default(),
                     &mut accumulated_consume_units,
@@ -1250,7 +1250,7 @@ impl LiteSVM {
         &self,
         sanitized_tx: SanitizedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
-        instrumenter: Rc<RefCell<Instrumenter>>,
+        depth_manager: Rc<RefCell<DepthManager>>,
     ) -> ExecutionResult {
         let CheckAndProcessTransactionSuccess {
             core:
@@ -1263,7 +1263,7 @@ impl LiteSVM {
         } = match self.check_and_process_transaction_with_instrumenter(
             &sanitized_tx,
             log_collector,
-            instrumenter,
+            depth_manager,
         ) {
             Ok(value) => value,
             Err(value) => return value,
@@ -1317,7 +1317,7 @@ impl LiteSVM {
         &self,
         sanitized_tx: &SanitizedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
-        instrumenter: Rc<RefCell<Instrumenter>>,
+        depth_manager: Rc<RefCell<DepthManager>>,
     ) -> Result<CheckAndProcessTransactionSuccess, ExecutionResult> {
         self.maybe_blockhash_check(sanitized_tx)?;
         let compute_budget_limits = get_compute_budget_limits(sanitized_tx, &self.feature_set)?;
@@ -1327,7 +1327,7 @@ impl LiteSVM {
                 sanitized_tx,
                 compute_budget_limits,
                 log_collector,
-                instrumenter,
+                depth_manager,
             );
         Ok(CheckAndProcessTransactionSuccess {
             core: {
@@ -1379,13 +1379,13 @@ impl LiteSVM {
         &self,
         tx: VersionedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
-        instrumenter: Rc<RefCell<Instrumenter>>,
+        depth_manager: Rc<RefCell<DepthManager>>,
     ) -> ExecutionResult {
         map_sanitize_result(self.sanitize_transaction(tx), |s_tx| {
             self.execute_sanitized_transaction_readonly_with_instrumenter(
                 s_tx,
                 log_collector,
-                instrumenter,
+                depth_manager,
             )
         })
     }
@@ -1496,7 +1496,7 @@ impl LiteSVM {
     pub fn simulate_transaction_with_instrumenter(
         &self,
         tx: impl Into<VersionedTransaction>,
-        instrumenter: Rc<RefCell<Instrumenter>>,
+        depth_manager: Rc<RefCell<DepthManager>>,
     ) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
         let log_collector = LogCollector {
             bytes_limit: self.log_bytes_limit,
@@ -1515,7 +1515,7 @@ impl LiteSVM {
             self.execute_transaction_readonly_with_instrumenter(
                 tx.into(),
                 log_collector.clone(),
-                instrumenter,
+                depth_manager,
             )
         } else {
             self.execute_transaction_no_verify_readonly(tx.into(), log_collector.clone())
