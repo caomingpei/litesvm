@@ -1,5 +1,8 @@
 // copied from agave commit 63b13a1f6ad263fb62e1f80156eaf09838f1aff0
 // with some execute_timings usage removed
+use novafuzz_instrument::Instrumenter;
+use std::cell::RefCell;
+use std::rc::Rc;
 use {
     solana_program_runtime::invoke_context::InvokeContext, solana_svm_timings::ExecuteTimings,
     solana_svm_transaction::svm_message::SVMMessage, solana_transaction_context::IndexOfAccount,
@@ -39,6 +42,51 @@ pub(crate) fn process_message(
             )
         } else {
             invoke_context.process_instruction(&mut compute_units_consumed, execute_timings)
+        };
+
+        *accumulated_consumed_units =
+            accumulated_consumed_units.saturating_add(compute_units_consumed);
+
+        result.map_err(|err| {
+            TransactionError::InstructionError(top_level_instruction_index as u8, err)
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn process_message_with_instrumenter(
+    message: &impl SVMMessage,
+    program_indices: &[IndexOfAccount],
+    invoke_context: &mut InvokeContext,
+    execute_timings: &mut ExecuteTimings,
+    accumulated_consumed_units: &mut u64,
+    instrumenter: Rc<RefCell<Instrumenter>>,
+) -> Result<(), TransactionError> {
+    debug_assert_eq!(program_indices.len(), message.num_instructions());
+    for (top_level_instruction_index, ((program_id, instruction), program_account_index)) in message
+        .program_instructions_iter()
+        .zip(program_indices.iter())
+        .enumerate()
+    {
+        invoke_context
+            .prepare_next_top_level_instruction(message, &instruction, *program_account_index)
+            .map_err(|err| {
+                TransactionError::InstructionError(top_level_instruction_index as u8, err)
+            })?;
+
+        let mut compute_units_consumed = 0;
+        let result = if invoke_context.is_precompile(program_id) {
+            invoke_context.process_precompile(
+                program_id,
+                instruction.data,
+                message.instructions_iter().map(|ix| ix.data),
+            )
+        } else {
+            invoke_context.process_instruction_with_instrumenter(
+                &mut compute_units_consumed,
+                execute_timings,
+                instrumenter.clone(),
+            )
         };
 
         *accumulated_consumed_units =

@@ -76,6 +76,7 @@ solana-transaction = { workspace = true, features = ["verify"] }
 solana-transaction-context.workspace = true
 solana-transaction-error.workspace = true
 thiserror.workspace = true
+novafuzz-instrument.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

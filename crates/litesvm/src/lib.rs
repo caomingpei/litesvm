@@ -347,6 +347,9 @@ mod precompiles;
 mod programs;
 mod utils;
 
+use crate::message_processor::process_message_with_instrumenter;
+use novafuzz_instrument::Instrumenter;
+
 #[derive(Clone)]
 pub struct LiteSVM {
     accounts: AccountsDb,
@@ -993,6 +996,196 @@ impl LiteSVM {
         }
     }
 
+    fn process_transaction_with_instumenter(
+        &self,
+        tx: &SanitizedTransaction,
+        compute_budget_limits: ComputeBudgetLimits,
+        log_collector: Rc<RefCell<LogCollector>>,
+        instrumenter: Rc<RefCell<Instrumenter>>,
+    ) -> (
+        Result<(), TransactionError>,
+        u64,
+        Option<TransactionContext>,
+        u64,
+        Option<Pubkey>,
+    ) {
+        let compute_budget = self.compute_budget.unwrap_or_else(|| ComputeBudget {
+            compute_unit_limit: u64::from(compute_budget_limits.compute_unit_limit),
+            heap_size: compute_budget_limits.updated_heap_bytes,
+            ..ComputeBudget::new_with_defaults(false)
+        });
+        let blockhash = tx.message().recent_blockhash();
+        //reload program cache
+        let mut program_cache_for_tx_batch = self.accounts.programs_cache.clone();
+        let mut accumulated_consume_units = 0;
+        let message = tx.message();
+        let account_keys = message.account_keys();
+        let instruction_accounts = message
+            .instructions()
+            .iter()
+            .flat_map(|instruction| &instruction.accounts)
+            .unique()
+            .collect::<Vec<&u8>>();
+        let fee = solana_fee::calculate_fee(
+            message,
+            false,
+            self.fee_structure.lamports_per_signature,
+            0,
+            FeeFeatures::from(&self.feature_set),
+        );
+        let mut validated_fee_payer = false;
+        let mut payer_key = None;
+        let maybe_accounts = account_keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let mut account_found = true;
+                let account = if solana_sdk_ids::sysvar::instructions::check_id(key) {
+                    construct_instructions_account(message)
+                } else {
+                    let instruction_account = u8::try_from(i)
+                        .map(|i| instruction_accounts.contains(&&i))
+                        .unwrap_or(false);
+                    let mut account = if !instruction_account
+                        && !message.is_writable(i)
+                        && self.accounts.programs_cache.find(key).is_some()
+                    {
+                        // Optimization to skip loading of accounts which are only used as
+                        // programs in top-level instructions and not passed as instruction accounts.
+                        self.accounts.get_account(key).unwrap()
+                    } else {
+                        self.accounts.get_account(key).unwrap_or_else(|| {
+                            account_found = false;
+                            let mut default_account = AccountSharedData::default();
+                            default_account.set_rent_epoch(0);
+                            default_account
+                        })
+                    };
+                    if !validated_fee_payer
+                        && (!message.is_invoked(i) || message.is_instruction_account(i))
+                    {
+                        validate_fee_payer(
+                            key,
+                            &mut account,
+                            i as IndexOfAccount,
+                            &self.accounts.sysvar_cache.get_rent().unwrap(),
+                            fee,
+                        )?;
+                        validated_fee_payer = true;
+                        payer_key = Some(*key);
+                    }
+                    account
+                };
+
+                Ok((*key, account))
+            })
+            .collect::<solana_transaction_error::TransactionResult<Vec<_>>>();
+        let mut accounts = match maybe_accounts {
+            Ok(accs) => accs,
+            Err(e) => {
+                return (Err(e), accumulated_consume_units, None, fee, payer_key);
+            }
+        };
+        if !validated_fee_payer {
+            error!("Failed to validate fee payer");
+            return (
+                Err(TransactionError::AccountNotFound),
+                accumulated_consume_units,
+                None,
+                fee,
+                payer_key,
+            );
+        }
+        let builtins_start_index = accounts.len();
+        let maybe_program_indices = tx
+            .message()
+            .instructions()
+            .iter()
+            .map(|c| {
+                let program_index = c.program_id_index as usize;
+                // This may never error, because the transaction is sanitized
+                let (program_id, program_account) = accounts.get(program_index).unwrap();
+                if native_loader::check_id(program_id) {
+                    return Ok(program_index as IndexOfAccount);
+                }
+                if !program_account.executable() {
+                    error!("Program account {program_id} is not executable.");
+                    return Err(TransactionError::InvalidProgramForExecution);
+                }
+
+                let owner_id = program_account.owner();
+                if native_loader::check_id(owner_id) {
+                    return Ok(program_index as IndexOfAccount);
+                }
+
+                if !accounts
+                    .get(builtins_start_index..)
+                    .ok_or(TransactionError::ProgramAccountNotFound)?
+                    .iter()
+                    .any(|(key, _)| key == owner_id)
+                {
+                    let owner_account = self.get_account(owner_id).unwrap();
+                    if !native_loader::check_id(owner_account.owner()) {
+                        error!(
+                            "Owner account {owner_id} is not owned by the native loader program."
+                        );
+                        return Err(TransactionError::InvalidProgramForExecution);
+                    }
+                    if !owner_account.executable {
+                        error!("Owner account {owner_id} is not executable");
+                        return Err(TransactionError::InvalidProgramForExecution);
+                    }
+                    //Add program_id to the stuff
+                    accounts.push((*owner_id, owner_account.into()));
+                }
+                Ok(program_index as IndexOfAccount)
+            })
+            .collect::<Result<Vec<u16>, TransactionError>>();
+
+        match maybe_program_indices {
+            Ok(program_indices) => {
+                let mut context = self.create_transaction_context(compute_budget, accounts);
+                let feature_set = self.feature_set.runtime_features();
+                let mut invoke_context = InvokeContext::new(
+                    &mut context,
+                    &mut program_cache_for_tx_batch,
+                    EnvironmentConfig::new(
+                        *blockhash,
+                        self.fee_structure.lamports_per_signature,
+                        self,
+                        &feature_set,
+                        &self.accounts.sysvar_cache,
+                    ),
+                    Some(log_collector),
+                    compute_budget.to_budget(),
+                    SVMTransactionExecutionCost::default(),
+                );
+                let mut tx_result = process_message_with_instrumenter(
+                    tx.message(),
+                    &program_indices,
+                    &mut invoke_context,
+                    &mut ExecuteTimings::default(),
+                    &mut accumulated_consume_units,
+                    instrumenter,
+                )
+                .map(|_| ());
+
+                if let Err(err) = self.check_accounts_rent(tx, &context) {
+                    tx_result = Err(err);
+                };
+
+                (
+                    tx_result,
+                    accumulated_consume_units,
+                    Some(context),
+                    fee,
+                    payer_key,
+                )
+            }
+            Err(e) => (Err(e), accumulated_consume_units, None, fee, payer_key),
+        }
+    }
+
     fn check_accounts_rent(
         &self,
         tx: &SanitizedTransaction,
@@ -1050,6 +1243,17 @@ impl LiteSVM {
         })
     }
 
+    fn execute_transaction_with_instrumenter(
+        &mut self,
+        tx: VersionedTransaction,
+        log_collector: Rc<RefCell<LogCollector>>,
+        instrumenter: Rc<RefCell<Instrumenter>>,
+    ) -> ExecutionResult {
+        map_sanitize_result(self.sanitize_transaction(tx), |s_tx| {
+            self.execute_sanitized_transaction_with_instrumenter(s_tx, log_collector, instrumenter)
+        })
+    }
+
     fn execute_sanitized_transaction(
         &mut self,
         sanitized_tx: SanitizedTransaction,
@@ -1065,6 +1269,37 @@ impl LiteSVM {
             fee,
             payer_key,
         } = match self.check_and_process_transaction(&sanitized_tx, log_collector) {
+            Ok(value) => value,
+            Err(value) => return value,
+        };
+        if let Some(ctx) = context {
+            let tx_result = self.check_tx_result(result, payer_key, fee);
+            execution_result_if_context(sanitized_tx, ctx, tx_result, compute_units_consumed)
+        } else {
+            ExecutionResult::result_and_compute_units(result, compute_units_consumed)
+        }
+    }
+
+    fn execute_sanitized_transaction_with_instrumenter(
+        &mut self,
+        sanitized_tx: SanitizedTransaction,
+        log_collector: Rc<RefCell<LogCollector>>,
+        instrumenter: Rc<RefCell<Instrumenter>>,
+    ) -> ExecutionResult {
+        let CheckAndProcessTransactionSuccess {
+            core:
+                CheckAndProcessTransactionSuccessCore {
+                    result,
+                    compute_units_consumed,
+                    context,
+                },
+            fee,
+            payer_key,
+        } = match self.check_and_process_transaction_with_instrumenter(
+            &sanitized_tx,
+            log_collector,
+            instrumenter,
+        ) {
             Ok(value) => value,
             Err(value) => return value,
         };
@@ -1125,6 +1360,35 @@ impl LiteSVM {
         self.maybe_history_check(sanitized_tx)?;
         let (result, compute_units_consumed, context, fee, payer_key) =
             self.process_transaction(sanitized_tx, compute_budget_limits, log_collector);
+        Ok(CheckAndProcessTransactionSuccess {
+            core: {
+                CheckAndProcessTransactionSuccessCore {
+                    result,
+                    compute_units_consumed,
+                    context,
+                }
+            },
+            fee,
+            payer_key,
+        })
+    }
+
+    fn check_and_process_transaction_with_instrumenter(
+        &self,
+        sanitized_tx: &SanitizedTransaction,
+        log_collector: Rc<RefCell<LogCollector>>,
+        instrumenter: Rc<RefCell<Instrumenter>>,
+    ) -> Result<CheckAndProcessTransactionSuccess, ExecutionResult> {
+        self.maybe_blockhash_check(sanitized_tx)?;
+        let compute_budget_limits = get_compute_budget_limits(sanitized_tx, &self.feature_set)?;
+        self.maybe_history_check(sanitized_tx)?;
+        let (result, compute_units_consumed, context, fee, payer_key) = self
+            .process_transaction_with_instumenter(
+                sanitized_tx,
+                compute_budget_limits,
+                log_collector,
+                instrumenter,
+            );
         Ok(CheckAndProcessTransactionSuccess {
             core: {
                 CheckAndProcessTransactionSuccessCore {
@@ -1199,6 +1463,59 @@ impl LiteSVM {
             included,
         } = if self.sigverify {
             self.execute_transaction(vtx, log_collector.clone())
+        } else {
+            self.execute_transaction_no_verify(vtx, log_collector.clone())
+        };
+        let Ok(logs) = Rc::try_unwrap(log_collector).map(|lc| lc.into_inner().messages) else {
+            unreachable!("Log collector should not be used after send_transaction returns")
+        };
+        let meta = TransactionMetadata {
+            logs,
+            inner_instructions,
+            compute_units_consumed,
+            return_data,
+            signature,
+        };
+
+        if let Err(tx_err) = tx_result {
+            let err = TransactionResult::Err(FailedTransactionMetadata { err: tx_err, meta });
+            if included {
+                self.history.add_new_transaction(signature, err.clone());
+            }
+            err
+        } else {
+            self.history
+                .add_new_transaction(signature, Ok(meta.clone()));
+            self.accounts
+                .sync_accounts(post_accounts)
+                .expect("It shouldn't be possible to write invalid sysvars in send_transaction.");
+
+            TransactionResult::Ok(meta)
+        }
+    }
+
+    /// Submits a signed transaction with Instrumenter
+    pub fn send_transaction_with_instrumenter(
+        &mut self,
+        tx: impl Into<VersionedTransaction>,
+        instrumenter: Rc<RefCell<Instrumenter>>,
+    ) -> TransactionResult {
+        let log_collector = LogCollector {
+            bytes_limit: self.log_bytes_limit,
+            ..Default::default()
+        };
+        let log_collector = Rc::new(RefCell::new(log_collector));
+        let vtx: VersionedTransaction = tx.into();
+        let ExecutionResult {
+            post_accounts,
+            tx_result,
+            signature,
+            compute_units_consumed,
+            inner_instructions,
+            return_data,
+            included,
+        } = if self.sigverify {
+            self.execute_transaction_with_instrumenter(vtx, log_collector.clone(), instrumenter)
         } else {
             self.execute_transaction_no_verify(vtx, log_collector.clone())
         };
