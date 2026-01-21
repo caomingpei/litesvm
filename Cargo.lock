@@ -85,6 +85,7 @@ version = "3.0.7"
 dependencies = [
  "bincode",
  "libsecp256k1 0.6.0",
+ "novafuzz-instrument",
  "novafuzz-shared",
  "num-traits",
  "solana-account",
