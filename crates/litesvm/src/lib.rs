@@ -267,7 +267,8 @@ use {
         message_processor::process_message,
         programs::load_default_programs,
         types::{
-            ExecutionResult, FailedTransactionMetadata, TransactionMetadata, TransactionResult,
+            CommittedTransactionInfo, ExecutionResult, FailedTransactionMetadata,
+            TransactionMetadata, TransactionResult, TransactionWithPostAccountsResult,
         },
         utils::{
             create_blockhash,
@@ -1495,11 +1496,11 @@ impl LiteSVM {
     }
 
     /// Submits a signed transaction with Instrumenter
-    pub fn send_transaction_with_instrumenter(
+    pub fn send_transaction_with_instrumenter_and_post_accounts(
         &mut self,
         tx: impl Into<VersionedTransaction>,
         instrumenter: Rc<RefCell<Instrumenter>>,
-    ) -> TransactionResult {
+    ) -> TransactionWithPostAccountsResult {
         let log_collector = LogCollector {
             bytes_limit: self.log_bytes_limit,
             ..Default::default()
@@ -1531,20 +1532,35 @@ impl LiteSVM {
         };
 
         if let Err(tx_err) = tx_result {
-            let err = TransactionResult::Err(FailedTransactionMetadata { err: tx_err, meta });
+            let err = FailedTransactionMetadata { err: tx_err, meta };
             if included {
-                self.history.add_new_transaction(signature, err.clone());
+                self.history
+                    .add_new_transaction(signature, Err(err.clone()));
             }
-            err
+            Err(err)
         } else {
             self.history
                 .add_new_transaction(signature, Ok(meta.clone()));
+            let pre_sync_post_accounts = post_accounts.clone();
             self.accounts
                 .sync_accounts(post_accounts)
                 .expect("It shouldn't be possible to write invalid sysvars in send_transaction.");
 
-            TransactionResult::Ok(meta)
+            Ok(CommittedTransactionInfo {
+                meta,
+                post_accounts: pre_sync_post_accounts,
+            })
         }
+    }
+
+    /// Submits a signed transaction with Instrumenter.
+    pub fn send_transaction_with_instrumenter(
+        &mut self,
+        tx: impl Into<VersionedTransaction>,
+        instrumenter: Rc<RefCell<Instrumenter>>,
+    ) -> TransactionResult {
+        self.send_transaction_with_instrumenter_and_post_accounts(tx, instrumenter)
+            .map(|info| info.meta)
     }
 
     /// Simulates a transaction.

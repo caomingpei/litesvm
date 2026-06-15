@@ -34,6 +34,13 @@ pub struct SimulatedTransactionInfo {
     pub post_accounts: Vec<(Pubkey, AccountSharedData)>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CommittedTransactionInfo {
+    pub meta: TransactionMetadata,
+    pub post_accounts: Vec<(Pubkey, AccountSharedData)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FailedTransactionMetadata {
@@ -54,6 +61,8 @@ impl From<ProgramError> for FailedTransactionMetadata {
 }
 
 pub type TransactionResult = std::result::Result<TransactionMetadata, FailedTransactionMetadata>;
+pub type TransactionWithPostAccountsResult =
+    std::result::Result<CommittedTransactionInfo, FailedTransactionMetadata>;
 
 pub(crate) struct ExecutionResult {
     pub(crate) post_accounts: Vec<(Pubkey, AccountSharedData)>,
